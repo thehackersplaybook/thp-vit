@@ -27,6 +27,7 @@ import os
 import dotenv
 from datetime import datetime
 import platform
+import time
 
 dotenv.load_dotenv()
 
@@ -109,6 +110,8 @@ class HotkeyService:
         self.hotkey = self._parse_hotkey(hotkey)
         self.callback = callback or self._default_callback
         self.current_keys = set()
+        self.last_trigger_time = 0  # Add this
+        self.TRIGGER_COOLDOWN = 1.0  # Add this: 1 second cooldown
 
         if knowledge_source_path:
             os.makedirs(knowledge_source_path, exist_ok=True)
@@ -266,13 +269,22 @@ class HotkeyService:
             key: The key that was pressed
         """
         try:
+            current_time = time.time()
+
+            # Add key to current keys
             if hasattr(key, "char"):
                 self.current_keys.add(key.char)
             elif key == keyboard.Key.cmd:
                 self.current_keys.add("cmd")
 
-            if self.current_keys == self.hotkey:
+            # Check if hotkey is pressed and cooldown has elapsed
+            if (
+                self.current_keys == self.hotkey
+                and current_time - self.last_trigger_time > self.TRIGGER_COOLDOWN
+            ):
                 self.callback()
+                self.last_trigger_time = current_time
+                self.current_keys.clear()  # Reset keys after trigger
         except AttributeError:
             pass
 
@@ -284,10 +296,15 @@ class HotkeyService:
             key: The key that was released
         """
         try:
+            # Remove released key
             if hasattr(key, "char"):
                 self.current_keys.discard(key.char)
             elif key == keyboard.Key.cmd:
                 self.current_keys.discard("cmd")
+
+            # If all hotkey keys are released, clear the set
+            if not any(k in self.current_keys for k in self.hotkey):
+                self.current_keys.clear()
         except AttributeError:
             pass
 
