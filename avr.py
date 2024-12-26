@@ -18,7 +18,7 @@ Project: The Hackers Playbook, Valuable Internal Tools (VIT)
 from pynput import keyboard
 import argparse
 import sys
-from typing import Callable, Optional
+from typing import Callable, Optional, Literal
 import pyscreenshot
 import base64
 from io import BytesIO
@@ -28,6 +28,11 @@ import dotenv
 from datetime import datetime
 import platform
 import time
+from concurrent.futures import ThreadPoolExecutor
+from queue import Queue
+import threading
+import queue
+import pyperclip
 
 dotenv.load_dotenv()
 
@@ -108,13 +113,25 @@ class HotkeyService:
             callback (Optional[Callable]): Function to call when hotkey is pressed
         """
         self.hotkey = self._parse_hotkey(hotkey)
-        self.callback = callback or self._default_callback
         self.current_keys = set()
-        self.last_trigger_time = 0  # Add this
-        self.TRIGGER_COOLDOWN = 1.0  # Add this: 1 second cooldown
+        self.last_trigger_time = 0
+        self.TRIGGER_COOLDOWN = 0.5
+
+        # Queue configuration
+        self.MAX_QUEUE_SIZE = 10
+        self.processing_queue = Queue(maxsize=self.MAX_QUEUE_SIZE)
+        self.executor = ThreadPoolExecutor(max_workers=3)
+        self.processing_thread = threading.Thread(
+            target=self._process_queue, daemon=True
+        )
+        self.processing_thread.start()
 
         if knowledge_source_path:
             os.makedirs(knowledge_source_path, exist_ok=True)
+
+        # Set up hotkeys
+        self.screenshot_hotkey = self._parse_hotkey(hotkey)
+        self.clipboard_hotkey = self._parse_hotkey("cmd+z")
 
     def _parse_hotkey(self, hotkey: str) -> set:
         """
@@ -237,29 +254,99 @@ class HotkeyService:
         except Exception as e:
             print(f"Failed to play sound: {e}")
 
-    def _default_callback(self) -> None:
-        """Default action when hotkey is pressed."""
-        print(f"\n🎯 Hotkey '{'+'.join(self.hotkey)}' was triggered!")
+    def _process_queue(self):
+        """Process items from the queue."""
+        while True:
+            try:
+                content, source = self.processing_queue.get(timeout=1)
+                if content:
+                    future = self.executor.submit(
+                        self._process_content_item, content, source
+                    )
+                    future.add_done_callback(self._on_analysis_complete)
+                    self.processing_queue.task_done()
+            except queue.Empty:
+                continue
+            except Exception as e:
+                print(f"Error processing queue: {e}")
+                time.sleep(1)
+
+    def _process_content_item(self, content: str, source: str) -> tuple[str, bool]:
+        """Process a single content item."""
+        try:
+            print(f"📝 Processing {source}...")
+            if source == "screenshot":
+                analysis = self._analyze_image(content)
+            else:  # clipboard
+                # Just format the clipboard content with timestamp
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                analysis = f"""# Clipboard Content ({timestamp})
+
+{content}
+
+---"""
+            success = True  # Always true for clipboard content
+            return analysis, success
+        except Exception as e:
+            print(f"Error processing {source}: {e}")
+            return str(e), False
+
+    def _analyze_text(self, text: str) -> str:
+        """Analyze clipboard text content."""
+        try:
+            response = openai_client.chat.completions.create(
+                model="gpt-4",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": f"{SYSTEM_PROMPT}\n\nAnalyze this text:\n{text}",
+                    }
+                ],
+            )
+            return response.choices[0].message.content
+        except Exception as e:
+            return f"❌ Failed to analyze text: {str(e)}"
+
+    def _process_content(
+        self, content: str, source: Literal["screenshot", "clipboard"]
+    ) -> None:
+        """Process content from either screenshot or clipboard."""
+        try:
+            self.processing_queue.put((content, source), timeout=1)
+            queue_size = self.processing_queue.qsize()
+            print(
+                f"📥 {source.title()} content added to processing queue... ({queue_size}/{self.MAX_QUEUE_SIZE})"
+            )
+        except queue.Full:
+            print(
+                "⚠️ Processing queue is full! Please wait for current tasks to complete."
+            )
+            self.play_sound("error")
+
+    def _clipboard_callback(self) -> None:
+        """Handle clipboard content processing."""
+        print(f"\n📋 Clipboard processing triggered!")
+        self.play_sound("start")
+
+        try:
+            content = pyperclip.paste()
+            if content.strip():
+                self._process_content(content, "clipboard")
+            else:
+                print("❌ Clipboard is empty!")
+                self.play_sound("error")
+        except Exception as e:
+            print(f"❌ Failed to read clipboard: {e}")
+            self.play_sound("error")
+
+    def _screenshot_callback(self) -> None:
+        """Handle screenshot processing."""
+        print(f"\n🎯 Screenshot triggered!")
         self.play_sound("start")
 
         base64_img = self._take_screenshot()
         if base64_img:
-            print("📸 Screenshot captured! Analyzing...")
-            analysis = self._analyze_image(base64_img)
-
-            if "Failed to analyze" in analysis:
-                self.play_sound("error")
-            else:
-                self.play_sound("complete")
-
-            print("\n" + "=" * 50 + "\n")
-            print(analysis)
-            print("\n" + "=" * 50)
-            if knowledge_source_path:
-                self._append_to_knowledge(analysis)
-                self.play_sound("complete")
-            else:
-                self.play_sound("error")
+            self._process_content(base64_img, "screenshot")
 
     def _on_press(self, key) -> None:
         """
@@ -271,20 +358,21 @@ class HotkeyService:
         try:
             current_time = time.time()
 
-            # Add key to current keys
             if hasattr(key, "char"):
                 self.current_keys.add(key.char)
             elif key == keyboard.Key.cmd:
                 self.current_keys.add("cmd")
 
-            # Check if hotkey is pressed and cooldown has elapsed
-            if (
-                self.current_keys == self.hotkey
-                and current_time - self.last_trigger_time > self.TRIGGER_COOLDOWN
-            ):
-                self.callback()
-                self.last_trigger_time = current_time
-                self.current_keys.clear()  # Reset keys after trigger
+            # Check both hotkeys
+            if current_time - self.last_trigger_time > self.TRIGGER_COOLDOWN:
+                if self.current_keys == self.screenshot_hotkey:
+                    self._screenshot_callback()
+                    self.last_trigger_time = current_time
+                    self.current_keys.clear()
+                elif self.current_keys == self.clipboard_hotkey:
+                    self._clipboard_callback()
+                    self.last_trigger_time = current_time
+                    self.current_keys.clear()
         except AttributeError:
             pass
 
@@ -321,10 +409,40 @@ class HotkeyService:
 
         except KeyboardInterrupt:
             print("\n👋 Shutting down AVR...")
+            self.executor.shutdown(wait=False)  # Shutdown thread pool
             sys.exit(0)
         except Exception as e:
             print(f"❌ Error: {str(e)}")
+            self.executor.shutdown(wait=False)
             sys.exit(1)
+
+    def _on_analysis_complete(self, future) -> None:
+        """
+        Handle completed analysis.
+
+        Args:
+            future: Future object containing analysis result
+        """
+        try:
+            analysis, success = future.result()
+
+            if not success:
+                self.play_sound("error")
+            else:
+                self.play_sound("complete")
+
+            print("\n" + "=" * 50 + "\n")
+            print(analysis)
+            print("\n" + "=" * 50)
+
+            if knowledge_source_path:
+                self._append_to_knowledge(analysis)
+                self.play_sound("complete")
+            else:
+                self.play_sound("error")
+        except Exception as e:
+            print(f"Error handling analysis completion: {e}")
+            self.play_sound("error")
 
 
 def parse_args() -> argparse.Namespace:
